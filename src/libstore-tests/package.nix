@@ -118,7 +118,7 @@ mkMesonExecutable (finalAttrs: {
             + ''
               ${if withUnitTests then "test -x" else "test ! -e"} \
                 "${finalAttrs.finalPackage}/bin/${finalAttrs.pname}${stdenv.hostPlatform.extensions.executable}"
-              for target in fuzz-parse-derivation fuzz-parse-derivation-experimental fuzz-store-path; do
+              for target in fuzz-daemon-message fuzz-parse-derivation fuzz-parse-derivation-experimental fuzz-store-path; do
                 ${if withFuzzTargets then "test -x" else "test ! -e"} \
                   "${finalAttrs.finalPackage}/bin/$target${stdenv.hostPlatform.extensions.executable}"
               done

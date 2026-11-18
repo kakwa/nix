@@ -1,0 +1,7 @@
+# AFL++ 5.x PCGUARD instrumentation emits __sancov_guards sections for
+# C++20 coroutine resume functions. With Clang 21 the linker rejects those
+# sections as discarded. These two files are the only ones in libutil/libstore
+# that use coroutines, and neither is on the daemon message parsing path, so
+# excluding them from AFL instrumentation is safe.
+misc.cc
+http-binary-cache-store.cc

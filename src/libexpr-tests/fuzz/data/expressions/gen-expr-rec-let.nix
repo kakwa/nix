@@ -1,0 +1,1 @@
+let x = rec { y = x; }; in x

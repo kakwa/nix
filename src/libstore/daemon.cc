@@ -1185,11 +1185,12 @@ void processConnection(
     conn.to = std::move(to);
     conn.from = std::move(from);
 
-    auto tunnelLogger = new TunnelLogger(conn.to, conn.protoVersion);
+    TunnelLogger tunnelLogger(conn.to, conn.protoVersion);
     auto prevLogger = logger;
+    Finally restoreLogger([&]() { logger = prevLogger; });
     // FIXME
     if (recursive == RecursiveFlag::NotRecursive) {
-        logger = tunnelLogger;
+        logger = &tunnelLogger;
         applyJSONLogger();
     }
 
@@ -1207,11 +1208,11 @@ void processConnection(
         });
 
     /* Send startup error messages to the client. */
-    tunnelLogger->startWork();
+    tunnelLogger.startWork();
 
     try {
 
-        tunnelLogger->stopWork();
+        tunnelLogger.stopWork();
         conn.to.flush();
 
         /* Process client requests. */
@@ -1232,35 +1233,35 @@ void processConnection(
             debug("performing daemon worker op: %d", op);
 
             try {
-                performOp(tunnelLogger, store, trusted, recursive, conn, op, *builder);
+                performOp(&tunnelLogger, store, trusted, recursive, conn, op, *builder);
             } catch (Error & e) {
                 /* If we're not in a state where we can send replies, then
                    something went wrong processing the input of the
                    client.  This can happen especially if I/O errors occur
                    during addTextToStore() / importPath().  If that
                    happens, just send the error message and exit. */
-                bool errorAllowed = tunnelLogger->state_.lock()->canSendStderr;
-                tunnelLogger->stopWork(&e);
+                bool errorAllowed = tunnelLogger.state_.lock()->canSendStderr;
+                tunnelLogger.stopWork(&e);
                 if (!errorAllowed)
                     throw;
             } catch (std::bad_alloc & e) {
                 auto ex = Error("Nix daemon out of memory");
-                tunnelLogger->stopWork(&ex);
+                tunnelLogger.stopWork(&ex);
                 throw;
             }
 
             conn.to.flush();
 
-            assert(!tunnelLogger->state_.lock()->canSendStderr);
+            assert(!tunnelLogger.state_.lock()->canSendStderr);
         };
 
     } catch (Error & e) {
-        tunnelLogger->stopWork(&e);
+        tunnelLogger.stopWork(&e);
         conn.to.flush();
         return;
     } catch (std::exception & e) {
         auto ex = Error(e.what());
-        tunnelLogger->stopWork(&ex);
+        tunnelLogger.stopWork(&ex);
         conn.to.flush();
         return;
     }
