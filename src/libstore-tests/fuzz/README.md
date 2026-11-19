@@ -135,3 +135,55 @@ feature list. A seed is laid out as eight-byte little-endian words:
 
 Strings on the wire are an eight-byte length, the bytes, then zero padding to
 a multiple of eight; integers are always eight-byte little-endian values.
+
+## Known crashing inputs (regression)
+
+`regression/` holds inputs that are expected to crash the harnesses until the
+corresponding bug is fixed. They are deliberately kept out of `data/*`: the
+latter are the seed corpora replayed by `packaging/fuzz-seed-check.nix`, which
+expects every seed to run successfully.
+
+Currently:
+
+- `regression/afl-id-000000.bin`, `regression/afl-id-000001.bin`,
+  `regression/afl-id-000002.bin` — verbatim copies of the three AFL crash
+  artifacts from `afl-out/default/crashes/`. Original names/metadata:
+
+  | file in repo | original AFL filename | size |
+  | --- | --- | ---: |
+  | `afl-id-000000.bin` | `id:000000,sig:11,src:000537,time:1844122,execs:3356703,op:havoc,rep:16` | 67,457 B |
+  | `afl-id-000001.bin` | `id:000001,sig:11,src:000352,time:2624085,execs:4712895,op:havoc,rep:7` | 29,948 B |
+  | `afl-id-000002.bin` | `id:000002,sig:11,src:000485,time:6751891,execs:13122095,op:havoc,rep:49` | 29,304 B |
+
+- `regression/daemon-message-buildpaths-stackoverflow.bin` — a structurally
+  minimized `BuildPaths` request with a 17,000-character `!`-only derived-path
+  string. It reproduces the unbounded recursion in `parseWithSingle()`
+  (`src/libstore/derived-path.cc`) as a stack overflow. See `REPORT.md` at the
+  repository root for the full analysis. Replay with:
+
+  ```sh
+  build-fuzz/src/libstore-tests/fuzz/harnesses/fuzz-daemon-message \
+    src/libstore-tests/fuzz/regression/daemon-message-buildpaths-stackoverflow.bin
+  ```
+
+## Standalone daemon PoC
+
+`poc_embedded.c` and the prebuilt `poc-static` at the repository root are a
+self-contained version of the same reproducer. The 17,056-byte request is
+embedded in the binary; it does not need the fuzz harness, a seed file, or a
+Nix build. It connects to the local daemon socket and sends the request, then
+reports whether the worker closed the connection without an error reply (the
+expected stack overflow) or sent a normal protocol error (e.g. a patched
+daemon).
+
+```sh
+# Rebuild it if needed:
+cc -static -O2 -o poc-static poc_embedded.c
+
+# Copy just poc-static to a Nix host and run:
+./poc-static
+# Socket selection: argument, NIX_DAEMON_SOCKET_PATH,
+# NIX_REMOTE=unix://PATH, then /nix/var/nix/daemon-socket/socket.
+./poc-static /nix/var/nix/daemon-socket/socket
+```
+

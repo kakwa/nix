@@ -2,11 +2,13 @@
 
 ## Executive summary
 
-The two crash artifacts in
+The three crash artifacts in
 `/tmp/opencode/nix-fuzz-parent/afl-out/default/crashes` are **the same bug**.
-Both are stack exhaustion caused by unbounded recursion in Nix's daemon-side
+All are stack exhaustion caused by unbounded recursion in Nix's daemon-side
 `DerivedPath` parser. The recursion is reachable from the `BuildPaths` worker
 protocol operation, before any trust or repair-mode check is performed.
+The third artifact was found later by continued fuzzing and was re-checked in
+detail; it does not add a new vulnerability class (see "Crash 3" below).
 
 **Verdict:** this is **not a memory-corruption or code-execution vulnerability**.
 It is a **local denial-of-service** issue (CWE-674, uncontrolled recursion). A
@@ -36,8 +38,16 @@ automatic restart.
 | --- | ---: | --- |
 | `id:000000,sig:11,src:000537,time:1844122,execs:3356703,op:havoc,rep:16` | 67,457 B | SIGSEGV, havoc mutation |
 | `id:000001,sig:11,src:000352,time:2624085,execs:4712895,op:havoc,rep:7` | 29,948 B | SIGSEGV, havoc mutation |
+| `id:000002,sig:11,src:000485,time:6751891,execs:13122095,op:havoc,rep:49` | 29,304 B | SIGSEGV, havoc mutation (found 2026-11-18 22:51) |
 
-Both were found with:
+Verbatim copies of all three artifacts are saved in this repository under
+`src/libstore-tests/fuzz/regression/` as `afl-id-000000.bin`,
+`afl-id-000001.bin` and `afl-id-000002.bin` (sha256 respectively
+`c8dee7139cf661961b68b34ca47887532267622ad208eddad7a7abd37a7bb8cb`,
+`56247fa6c2502e7f590045c9b75e6ccb53590c9175dd6125a304d6c897292423`,
+`efeaa17013299cc11411edf1b7dc1aeeeedf96df2d7570a94e8c27c8cea56981`).
+
+All were found with:
 
 ```text
 afl-fuzz -i src/libstore-tests/fuzz/data/daemon-messages \
@@ -157,6 +167,28 @@ Thread 1 "fuzz-daemon-mes" received signal SIGSEGV, Segmentation fault.
 The only differences between the two runs were the writer-thread LWP ID and one
 register value; the crash path and depth were the same.
 
+### Crash 3 — `id:000002` (newer artifact)
+
+Replayed under both harnesses. gdb shows the same signature: SIGSEGV in
+`std::string_view::rfind`, then ~16,300 frames at `derived-path.cc:132`, followed
+by `parseWith` → `parseLegacy` → `worker-protocol.cc:212` → `daemon.cc:593` →
+`processConnection`. ASAN again reports:
+
+```text
+ERROR: AddressSanitizer: stack-overflow
+  #1 __asan_memcpy
+  #2 nix::parseWithSingle(...) at derived-path.cc:127
+  #3+ repeated frames at derived-path.cc:132
+```
+
+The payload is 29,304 bytes of which 25,409 are `!` bytes (plus unrelated havoc
+garbage) — the same recursive separator trigger, just a larger mutation. There
+is no new bug class and no change to the risk assessment.
+
+`afl-tmin` was attempted but timed out during its final character-minimization
+stage. A structurally minimized reproducer was produced instead (see "Minimal
+proof of concept" below).
+
 ---
 
 ## Root cause
@@ -236,9 +268,38 @@ n = 17000  -> exit 139 (SIGSEGV)
 n = 20000  -> exit 139 (SIGSEGV)
 ```
 
-The ASAN build crashes as well (confirmed at `n = 17000`) with
-`AddressSanitizer: stack-overflow`. The exact threshold depends on stack rlimit
-and compiler instrumentation.
+A binary search over `n` with that build found the exact threshold at
+**`n = 16319`** (16,376 bytes total); `n = 16318` exits normally. The ASAN build
+crashes as well with `AddressSanitizer: stack-overflow`. The threshold depends on
+stack rlimit and compiler instrumentation.
+
+A margin-keeping reproducer at `n = 17000` (17,056 bytes) is stored as a
+regression input at:
+
+```text
+src/libstore-tests/fuzz/regression/daemon-message-buildpaths-stackoverflow.bin
+sha256 16b7c8d9d38bb9617d20559e3635da7c37fd7f63cdbf3ac13e5531c03e6099e1
+```
+
+It crashes both harnesses with the same stack as the original artifacts. It is
+deliberately **not** placed in `data/daemon-messages/`, because that directory is
+the seed corpus used by `packaging/fuzz-seed-check.nix`, which replays every seed
+and expects no crash. See `src/libstore-tests/fuzz/README.md`.
+
+For testing against a real nix-daemon, the repository root also contains a
+single-file, statically linked PoC: `poc-static` (source `poc_embedded.c`). It
+embeds those same 17,056 wire bytes and sends them to the daemon socket, so only
+that one file needs to be copied to the target host:
+
+```sh
+./poc-static                        # /nix/var/nix/daemon-socket/socket
+NIX_DAEMON_SOCKET_PATH=/run/nix/daemon-socket ./poc-static
+./poc-static /path/to/daemon-socket
+```
+
+It prints whether the daemon worker closed the connection without a protocol
+error (expected stack overflow) or replied with an error (bug fixed / request
+rejected).
 
 ---
 
@@ -294,15 +355,25 @@ ordinary remote attackers cannot reach this code.
 ## Recommendations
 
 1. Add an explicit recursion-depth limit to `parseWithSingle()` and `parseWith()`
-   (for example 64 or 128 levels) and throw a normal `Error` when exceeded.
+   (the draft patch below uses 1000 levels; a smaller value such as 64 or 128 is
+   also defensible for legitimate derived paths) and throw a normal `Error` when
+   exceeded.
 2. Prefer rewriting the parser as an iterative loop that repeatedly splits on
    the last separator and builds the nested representation on the way back.
 3. Optionally cap the accepted length of a worker-protocol `DerivedPath` string
    in `WorkerProto::Serialise<DerivedPath>::read`.
-4. Add a regression corpus entry containing a long `!`-only derived-path string
-   to `src/libstore-tests/fuzz/data/daemon-messages/`.
+4. A regression reproducer has been added at
+   `src/libstore-tests/fuzz/regression/daemon-message-buildpaths-stackoverflow.bin`.
+   Once the depth cap lands, wire it into a negative test that expects a normal
+   `Error` (not a signal). Do **not** add it to `data/daemon-messages/`: that is
+   the seed corpus replayed by `packaging/fuzz-seed-check.nix`, which expects
+   every seed to succeed.
 5. Consider per-client crash accounting, or resetting the global crash counter,
    so a single abusive user cannot terminate the acceptor for everyone.
-6. If reporting upstream, attach the two AFL artifacts and the minimal PoC
-   generator above; both original crashes reduce cleanly to the same recursion
-   bug.
+6. If reporting upstream, attach all three AFL artifacts and the minimal PoC
+   generator above; all three reduce cleanly to the same recursion bug.
+7. A draft, **unapplied** patch for recommendation 1 is at
+   `/tmp/opencode/nix-fuzz-parent/fix-derived-path-recursion.patch`. It adds a
+   depth cap (`maxDerivedPathDepth = 1000`) to `parseWithSingle()` and
+   `parseWith()` and throws a normal `Error` when exceeded. It passes
+   `git apply --check` but has not been committed to the source tree.
