@@ -1,6 +1,186 @@
-# Security assessment: AFL crashes in `fuzz-daemon-message`
+# Security assessment: Nix daemon fuzzing + live VM probes
 
 ## Executive summary
+
+Two distinct findings:
+
+1. **HIGH — untrusted (allowed) local users can delete store paths via GC.**
+   The daemon's `CollectGarbage` operation has **no trusted-user gate** on the
+   destructive `gcDeleteDead` / `gcDeleteSpecific` actions; only
+   `ignoreLiveness` is checked. With the common `allowed-users = *` plus the
+   default `0666` socket, *any* local user can make the root daemon garbage-collect
+   the shared store, deleting valid-but-unrooted paths of all users. Confirmed on
+   all five probed VMs (Nix 2.35.6, `trusted-users = root`, `sandbox = true`):
+   `nix store gc` issued as the untrusted `nixos` user deleted real store paths
+   (17 paths / 127 MiB on one VM; **160 paths including `stdenv-linux`** on
+   another). This is a store integrity/availability compromise, not just a DoS.
+
+2. **HIGH — unauthenticated worker-protocol stack-overflow DoS.** The three AFL
+   crash artifacts are **the same bug**: unbounded recursion in the daemon-side
+   `DerivedPath` legacy parser, reachable from `BuildPaths` *before* any trust
+   check. Any local user can crash the per-connection worker (~14k–17k `!`
+   separators, stack-size dependent); ~64 such connections trip the acceptor's
+   crash limit and stop the socket service for everyone. Not memory corruption,
+   not code execution — pure stack exhaustion.
+
+A smaller **Medium** finding: `OptimiseStore` and `AddSignatures` are also not
+trusted-gated (unauthenticated store mutation / signature-append; both
+integrity-bounded by the content-addressing and `require-sigs` mechanisms).
+
+The **build sandbox itself is sound**: `__noChroot` is correctly refused for
+untrusted users under `sandbox = true`, and no chroot escape, network egress,
+sensitive-file access, or store-write from a build was demonstrated. No
+privilege escalation was found.
+
+---
+
+## Live VM probe program (findings 1, 2, and the Medium items)
+
+Five NixOS VMs (Nix 2.35.6, kernel 6.18.63) were probed end-to-end:
+
+| VM | IP | Store | Notable live evidence |
+| --- | --- | --- | --- |
+| vm-1 | 192.168.1.228 | RO ext4 mount | `nix store gc` (untrusted) deleted 65 + 21 paths (~255 MiB); `addtostorenar`/`optimizestore` accepted untrusted |
+| vm-2 | 192.168.1.204 | RO ext4 mount | `nix store gc` (untrusted) deleted 17 paths / 127.4 MiB; crash threshold 13,767 |
+| vm-3 | 192.168.1.214 | RO ext4 mount | `nix store gc` (untrusted) deleted 161 paths incl. `stdenv-linux`/`bash`/`coreutils`; crash threshold 13,763 |
+| vm-4 | 192.168.1.218 | RO ext4 mount | `nix store gc` (untrusted) deleted **160 paths** incl. `stdenv-linux`, `gcc-wrapper`, `patchelf`; crash threshold 13,761 |
+| vm-5 | 192.168.1.242 | RO ext4 mount | `nix store gc` (untrusted) deleted **339 paths** incl. `stdenv-linux`, `bash`, `coreutils`; crash threshold 13,763 |
+
+Common configuration: `allowed-users = *`, `trusted-users = root`,
+`sandbox = true`, `sandbox-fallback = false`, `require-sigs = true`,
+socket-activated daemon, socket mode `0666`, 32 locked `nixbld*` users.
+Probes ran as the untrusted `nixos` user (uid 1000; `Trusted: 0` per
+`nix store info`), over the daemon socket with a static worker-protocol client
+and with the stock `nix` CLI.
+
+Per-VM detail: `src/libstore-tests/fuzz/vm-probe-results/vmN-<ip>.md`.
+
+### F1 — `CollectGarbage` is not trusted-gated (HIGH)
+
+`src/libstore/daemon.cc`, `case WorkerProto::Op::CollectGarbage` (lines 794–834)
+contains exactly **one** authorization check:
+
+```cpp
+if (options.ignoreLiveness)
+    throw Error("you are not allowed to ignore liveness");
+```
+
+There is no check that the client is *trusted* (or even the store owner) for
+`GCAction::gcDeleteDead` or `gcDeleteSpecific`. The client-side
+`nix store gc` (`src/nix/store-gc.cc:44`) sends `gcDeleteDead` (or
+`gcDeleteSpecific` for `nix store delete`), and `authPeer()`
+(`src/nix/unix/daemon.cc:239`) accepts any *allowed* user as
+`TrustedFlag::NotTrusted` — which `allowed-users = *` makes everyone. The root
+daemon then performs the deletions.
+
+Live evidence (untrusted `nixos`):
+
+```text
+# vm-4
+$ nix store info | grep Trusted
+Trusted: 0
+$ nix store gc
+deleting '/nix/store/...-stdenv-linux'
+deleting '/nix/store/...-gcc-wrapper-15.3.0.drv'
+...
+160 store paths deleted          # store count 11769 -> 11609
+
+# vm-2
+$ nix store gc
+deleting '/nix/store/...-gnutar-1.35'
+...
+17 store paths deleted, 127.4 MiB freed
+```
+
+Impact: any unprivileged local user can purge the shared store, breaking builds
+and installations for all users and forcing re-fetches; with `--max` it is a
+metered deletion, and repeated runs are a persistent local availability attack.
+`gcDeleteSpecific` (`nix store delete <paths>`) extends this to *targeted*
+deletion of specific paths (those not reachable from roots).
+
+Note the asymmetry with the rest of the daemon, which *does* gate its
+destructive operations on `trusted`: `VerifyStore` repair, `AddToStore`/
+`AddToStoreNar` repair, `BuildPaths`/`BuildPathsWithResults` repair mode,
+`BuildDerivation` input-addressed builds, `AddPermRoot`, `AddBuildLog`. GC is
+the outlier.
+
+**Proposed fix:** in `performOp`, reject destructive GC actions for untrusted
+clients, e.g.
+
+```cpp
+if ((options.action == GCAction::gcDeleteDead ||
+     options.action == GCAction::gcDeleteSpecific) && !trusted)
+    throw Error("you are not privileged to garbage collect the store");
+```
+
+(Read-only GC actions `gcReturnLive`/`gcReturnDead` may remain open;
+`ignoreLiveness` stays gated as today. An alternative is a dedicated
+`gc-users` setting, but the minimal correct change is the trusted gate.)
+
+### F2 — untrusted `OptimiseStore` / `AddSignatures` (Medium)
+
+* `case WorkerProto::Op::OptimiseStore` (lines 937–942) has no `trusted` check:
+  any allowed user can trigger store-wide hardlink dedup. Integrity-preserving
+  (hash-identical files only) but an unauthorized store mutation; observed
+  running to completion for untrusted `nixos` on vm-1 and vm-4.
+* `case WorkerProto::Op::AddSignatures` (lines 956–964) has no `trusted` check:
+  an untrusted client can append signature entries to a store path's
+  `ValidPathInfo`. Impact is bounded — `checkSignatures()`
+  (`src/libstore/path-info.cc:126`) only accepts signatures that verify against
+  `trusted-public-keys`, so a forged entry cannot make a path trusted or
+  `ultimate`; but it is an authorization gap and a vector for polluting
+  path-info state.
+
+**Proposed fix:** add `if (!trusted) throw Error(...)` to both cases.
+
+### F3 — `nix store add` by untrusted users (Info / by design)
+
+`nix store add` works for untrusted users on every VM (paths land as
+`root:nixbld`, mode `0444`). This is **intentional**: the path is a
+content-addressed hash of the exact content, `info.ultimate` is forced false
+for untrusted clients (`daemon.cc:992`), and with `require-sigs = true` such
+paths cannot be *substituted into builds* by other users
+(`pathInfoIsUntrusted`, `src/libstore/local-store.cc:1073`). It does not break
+store integrity (no overwrite of a different path is possible) and is reported
+here only to contrast with F1: the daemon *does* model store *additions* by
+untrusted users as an expected, integrity-preserving capability — while
+store *deletion* (GC) is mistakenly treated as equally open.
+
+### Sandbox and privilege-escalation results: SAFE
+
+Probed and **blocked** on every VM (details in the per-VM files):
+
+* `__noChroot = true` / `__noSandbox = true` — refused for untrusted users
+  when `sandbox = true` (the existing trusted-gate holds).
+* Build chroot: writes outside the chroot, reads of `/etc/shadow`, direct
+  `/nix/store` writes from a build, symlink/hardlink escapes, and network
+  egress (curl to the cloud metadata endpoint, `/proc/net/tcp` empty) all
+  failed. Network namespace isolation verified.
+* `setoptions` accepted for untrusted users but is **per-connection only**:
+  restricted settings are dropped for untrusted clients
+  (`ClientSettings::apply`, `daemon.cc:297-309`), and a subsequent fresh build
+  was still chrooted. No global config change, no sandbox disable.
+* Direct `/nix/store` write as `nixos` — `Read-only file system` (the store is
+  a read-only ext4 mount; note this mount property is *defense in depth*, not
+  the authorization mechanism — the daemon would delete from it anyway, see
+  F1).
+* `AddPermRoot`, input-addressed `BuildDerivation`, `VerifyStore --repair`,
+  `AddToStore`/`AddToStoreNar` with `repair=1` — all correctly refused.
+* `nixbld*` accounts locked; SUID/SGID surface is the standard NixOS set;
+  unprivileged user namespaces are available (`user.max_user_namespaces =
+  7719`, stock NixOS baseline) with no demonstrated escalation path.
+* `require-sigs` holds: `nix store verify` reports untrusted paths as such;
+  unsigned realisations are rejected.
+
+**Caveat:** the probe VMs give `nixos` passwordless `sudo` (cloud-init test
+provisioning). All protocol-level findings were still issued as the *untrusted*
+`nixos` principal over the daemon socket (daemon logs `user nixos`), so the
+findings are independent of the sudo access; on a stock NixOS host without
+NOPASSWD sudo the same operations are available to any regular local user.
+
+---
+
+## Finding 2 detail: AFL crashes in `fuzz-daemon-message` (worker DoS)
 
 The three crash artifacts in
 `/tmp/opencode/nix-fuzz-parent/afl-out/default/crashes` are **the same bug**.
@@ -15,7 +195,10 @@ It is a **local denial-of-service** issue (CWE-674, uncontrolled recursion). A
 user who is allowed to connect to the Nix daemon can send a crafted
 `BuildPaths` request containing a derived-path string with enough `!` separators
 to crash the per-connection daemon worker. Roughly 16,500–17,000 separator
-bytes are sufficient with the default 8 MiB stack in this build.
+bytes are sufficient with the default 8 MiB stack in the reference build; on
+the live 2.35.6 VMs the threshold was lower and build-specific (13,761–13,767
+separators), confirming it depends on per-frame stack usage and worker stack
+size rather than being a fixed wire-format property.
 
 The normal nix-daemon accepts a Unix-domain socket (default mode `0666`) and
 defaults to `allowed-users = *`, so an unprivileged local user can reach this
@@ -24,11 +207,11 @@ only kills that user's own worker. However, the acceptor aborts after 64 worker
 crashes (`crashLimit = 64` in `src/nix/unix/daemon.cc`), so repeated malformed
 connections can terminate the daemon acceptor for all users until it is
 restarted (normally automatically by socket activation). There is no
-confidentiality or integrity impact.
+confidentiality or integrity impact from this crash itself (see F1 for the
+integrity findings).
 
-Typical severity: **Low** (local, availability-only, worker-isolated), rising to
-**Medium** on hosts that depend continuously on the Nix daemon and lack rapid
-automatic restart.
+Typical severity: **Low–Medium** for the crash alone (local, availability-only,
+worker-isolated), rising on hosts that depend continuously on the Nix daemon.
 
 ---
 
@@ -271,7 +454,10 @@ n = 20000  -> exit 139 (SIGSEGV)
 A binary search over `n` with that build found the exact threshold at
 **`n = 16319`** (16,376 bytes total); `n = 16318` exits normally. The ASAN build
 crashes as well with `AddressSanitizer: stack-overflow`. The threshold depends on
-stack rlimit and compiler instrumentation.
+stack rlimit and compiler instrumentation — on the live Nix 2.35.6 VMs it was
+**13,761–13,767** separators (vm-4: 13,760 clean / 13,761 crash; vm-2: 13,766
+clean / 13,767 crash), i.e. the reference figure is build-specific, and the
+17 KB regression reproducer crashes both builds with margin.
 
 A margin-keeping reproducer at `n = 17000` (17,056 bytes) is stored as a
 regression input at:
@@ -354,25 +540,33 @@ ordinary remote attackers cannot reach this code.
 
 ## Recommendations
 
-1. Add an explicit recursion-depth limit to `parseWithSingle()` and `parseWith()`
+1. **Gate destructive GC on `trusted`** (finding F1, HIGH): reject
+   `gcDeleteDead` / `gcDeleteSpecific` for untrusted clients in
+   `case WorkerProto::Op::CollectGarbage`, mirroring the existing
+   `repair`/`AddPermRoot`/input-addressed-build checks. See F1 for the
+   proposed code.
+2. **Gate `OptimiseStore` and `AddSignatures` on `trusted`** (finding F2,
+   Medium): add `if (!trusted) throw Error(...)` to both cases.
+3. Add an explicit recursion-depth limit to `parseWithSingle()` and `parseWith()`
    (the draft patch below uses 1000 levels; a smaller value such as 64 or 128 is
    also defensible for legitimate derived paths) and throw a normal `Error` when
    exceeded.
-2. Prefer rewriting the parser as an iterative loop that repeatedly splits on
+4. Prefer rewriting the parser as an iterative loop that repeatedly splits on
    the last separator and builds the nested representation on the way back.
-3. Optionally cap the accepted length of a worker-protocol `DerivedPath` string
+5. Optionally cap the accepted length of a worker-protocol `DerivedPath` string
    in `WorkerProto::Serialise<DerivedPath>::read`.
-4. A regression reproducer has been added at
+6. A regression reproducer has been added at
    `src/libstore-tests/fuzz/regression/daemon-message-buildpaths-stackoverflow.bin`.
    Once the depth cap lands, wire it into a negative test that expects a normal
    `Error` (not a signal). Do **not** add it to `data/daemon-messages/`: that is
    the seed corpus replayed by `packaging/fuzz-seed-check.nix`, which expects
    every seed to succeed.
-5. Consider per-client crash accounting, or resetting the global crash counter,
+7. Consider per-client crash accounting, or resetting the global crash counter,
    so a single abusive user cannot terminate the acceptor for everyone.
-6. If reporting upstream, attach all three AFL artifacts and the minimal PoC
-   generator above; all three reduce cleanly to the same recursion bug.
-7. A draft, **unapplied** patch for recommendation 1 is at
+8. If reporting upstream, attach all three AFL artifacts and the minimal PoC
+   generator above; all three reduce cleanly to the same recursion bug. The GC
+   trusted-gate gap (F1) is a separate upstream issue.
+9. A draft, **unapplied** patch for recommendation 3 is at
    `/tmp/opencode/nix-fuzz-parent/fix-derived-path-recursion.patch`. It adds a
    depth cap (`maxDerivedPathDepth = 1000`) to `parseWithSingle()` and
    `parseWith()` and throws a normal `Error` when exceeded. It passes
